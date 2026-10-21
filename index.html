@@ -944,12 +944,17 @@ const LS = {
   get(k, d){ try{ const v = localStorage.getItem(LSP+k); return v==null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(LSP+k, JSON.stringify(v)); return true; }catch(e){ return false; } },
 };
+function readyProfile(){
+  const p = LS.get("profile", null);
+  if(!p || !String(p.name || "").trim() || !String(p.contact_handle || "").trim()) return null;
+  return p;
+}
 
 /* ---------- app state ---------- */
 const A = {
   lang: LS.get("lang", null) || (()=>{ const l=(navigator.language||"").toLowerCase(); return l.startsWith("zh")?"zh":l.startsWith("fr")?"fr":l.startsWith("es")?"es":"en"; })(),
   view: "home", roomId: null, role: null, st: null, sig: "", offline: false, pollT: null, busy: false,
-  form: null, editProfile: false, answers: {}, pick: {meet: [], item: null}, again: null,
+  form: null, editProfile: false, afterProfile: "", pendingCode: "", answers: {}, pick: {meet: [], item: null}, again: null,
   mine: null, mineKey: "", mut: 0, draw: {key: "", strokes: [], sent: {}}, sessions: null, kept: {}, uploading: false, lastPhase: null,
 };
 const ACTS = ["quest","bingo","draw","bridge","spectrum","pairs","intro","ttol","photo","notes","team"];
@@ -1258,6 +1263,35 @@ function hostToken(){ const h = hosts().find(x => x.room_id === A.roomId); retur
 async function openByCode(code){
   code = String(code||"").trim().toUpperCase(); if(!code) return;
   try{ enterRoom(await api("getState", {code})); }catch(e){ A.view = "home"; render(); toast(errText(e)); }
+}
+function openCreate(){
+  leaveRoom();
+  A.afterProfile = ""; A.pendingCode = "";
+  A.view = "create"; A.occasion = "event"; A.control = false; A.kept["c-name"] = "";
+  A.plan = PRESETS.std.plan.slice(); A.opts = {}; A.helper = {}; A.helperOpen = false;
+  render();
+}
+function askProfile(next, code){
+  A.afterProfile = next; A.pendingCode = code || "";
+  leaveRoom();
+  A.view = "you"; A.form = null; A.formStep = 1; A.editProfile = false;
+  render();
+  try{ window.scrollTo(0, 0); }catch(e){}
+}
+function profileBody(F){
+  const tt = Array.isArray(F.tt) ? F.tt : [];
+  const full = tt.filter(Boolean).length === 3;
+  return { share_group: F.share_group !== false, name: F.name, avatar: F.avatar || "", major: F.major || "", year: F.year || "",
+    contact_app: F.contact_app, contact_handle: F.contact_handle, from: F.from || "",
+    tt: full ? tt : [], lie: full ? F.lie : -1, tot: F.tot || [], ask_me: askMe(F), wish: F.wish || "", photo: guessPhoto(F) };
+}
+async function joinSelf(roomId){
+  const F = readyProfile();
+  if(!F || !roomId) return;
+  const me = LS.get("me", {});
+  if(me[roomId]) return;
+  const res = await api("join", Object.assign({room_id: roomId}, profileBody(F)));
+  me[roomId] = res.person_id; LS.set("me", me);
 }
 function enterRoom(st){
   A.st = st; A.sig = ""; A.roomId = st.room.id; A.mineKey = ""; A.groupKey = ""; A.group = null; A.bingoLocal = {}; A.bingoSel = null; A.albumOpen = false; A.answers = LS.get("answers", {})[st.room.id] || {};
@@ -2084,7 +2118,7 @@ function whoLine(p){ return [p.major, p.year].filter(Boolean).join(" \u00b7 "); 
 function topicsLine(p){ const w = whoLine(p); if(w) return w; return String(p.ask_me || "").split(",").map(x => x.trim()).filter(Boolean).slice(0, 3).join(" \u00b7 "); }
 function profileView(mode){
   const prof = LS.get("profile", null), r = A.st && A.st.room;
-  if(mode === "room" && prof && prof.name && !A.editProfile){
+  if(mode === "room" && prof && prof.name && prof.contact_handle && !A.editProfile){
     return `<section class="hero"><p class="eyebrow">${esc(r.code)} \u00b7 ${esc(t("joinTitle", {name: r.name || APP_NAME}))}</p><h1>${esc(t("welcomeBack", {name: prof.name}))}</h1></section>
       <div class="pcard"><div class="who">${av(prof)}<div><b>${esc(prof.name)}</b><small class="muted">${esc(whoLine(prof) || prof.from || "")}</small></div></div>
         ${askMe(prof) ? `<p class="tags">${esc(askMe(prof))}</p>` : ""}</div>
@@ -2384,31 +2418,45 @@ document.addEventListener("click", async ev => {
   const a = b.dataset.a, v = b.dataset.v, st = A.st, r = st && st.room;
   const busy = async fn => { b.disabled = true; try{ await fn(); }catch(e){ toast(errText(e)); } finally{ b.disabled = false; } };
   switch(a){
-    case "home": A.wall = null; leaveRoom(); A.view = "home"; render(); break;
+    case "home": A.wall = null; A.afterProfile = ""; A.pendingCode = ""; leaveRoom(); A.view = "home"; render(); break;
     case "lang": A.lang = v; LS.set("lang", v); render(); break;
-    case "create": leaveRoom(); A.view = "create"; A.occasion = "event"; A.control = false; A.kept["c-name"] = ""; A.plan = PRESETS.std.plan.slice(); A.opts = {}; A.helper = {}; A.helperOpen = false; render(); break;
+    case "create": if(!readyProfile()){ askProfile("create"); break; } openCreate(); break;
     case "preset": A.plan = PRESETS[v].plan.slice(); A.opts = Object.assign({}, PRESETS[v].opts); render(); break;
     case "voteN": A.opts = Object.assign({}, A.opts, {vote_n: +v}); render(); break;
     case "helperToggle": ev.preventDefault(); A.helperOpen = !A.helperOpen; render(); break;
     case "helper": A.helper = Object.assign({}, A.helper, {[b.dataset.k]: v}); render(); break;
     case "useRec": { const rr = recommend(A.helper); A.plan = rr.plan; A.opts = rr.opts; render(); break; }
     case "doCreate": await busy(async () => {
+      if(!readyProfile()){ askProfile("create"); return; }
       const name = $("c-name").value.trim(), lang = $("c-lang").value, plan = A.control ? [] : ACTS.filter(x => ($("act-"+x) || {}).checked);
       const res = await api("createRoom", {name, lang, plan, opts: A.opts || {}, bingo: plan.includes("bingo") ? readBingo() : [], occasion: A.occasion || "event", circle: ($("c-circle").value || "").trim(), control: !!A.control});
       const hs = hosts(); hs.unshift({room_id: res.room_id, token: res.token, code: res.code, name, circle: ($("c-circle").value || "").trim(), created_at: new Date().toISOString()}); LS.set("hosts", hs.slice(0, 50));
+      try{ await joinSelf(res.room_id); }catch(e){ toast(errText(e)); }
       enterRoom(await api("getState", {room_id: res.room_id})); }); break;
-    case "joinCode": { const c = ($("home-code").value || "").trim(); if(c) await busy(() => openByCode(c)); break; }
+    case "joinCode": { const c = ($("home-code").value || "").trim(); if(!c) break;
+      if(!readyProfile()){ askProfile("join", c); break; }
+      await busy(() => openByCode(c)); break; }
     case "sessions": leaveRoom(); await openPlans(); break;
     case "tab": if(v === "plans") await openPlans(); else if(v === "you"){ A.view = "you"; A.form = null; A.formStep = 1; render(); } else { A.view = A.roomId ? "room" : "home"; render(); }
       try{ window.scrollTo(0, 0); }catch(e){} break;
-    case "profNext": { readForm(); if(!A.form.name){ const e = $("p-err"); e.textContent = t("nameNeeded"); e.hidden = false; break; }
-      if(!A.form.contact_handle && A.view === "room"){ const e = $("p-err"); e.textContent = t("contactNeeded"); e.hidden = false; break; } A.formStep = 2; render(); try{ window.scrollTo(0, 0); }catch(e){} break; }
+    case "profNext": { readForm(); const e = $("p-err");
+      if(!A.form.name){ e.textContent = t("nameNeeded"); e.hidden = false; break; }
+      if(!A.form.contact_handle){ e.textContent = t("contactNeeded"); e.hidden = false; break; }
+      A.formStep = 2; render(); try{ window.scrollTo(0, 0); }catch(e){} break; }
     case "profBack": readForm(); A.formStep = 1; render(); break;
     case "saveProfile": { const F = readForm(), filled = F.tt.filter(Boolean).length, err = $("p-err");
+      if(!F.name){ err.textContent = t("nameNeeded"); err.hidden = false; break; }
+      if(!F.contact_handle){ err.textContent = t("contactNeeded"); err.hidden = false; break; }
       if(F.tt.some(x => x.includes("___"))) F.tt = F.tt.map(x => x.includes("___") ? "" : x);
       if(filled && filled < 3){ err.textContent = t("ttolIncomplete"); err.hidden = false; break; }
       if(filled === 3 && !(F.lie >= 0)){ err.textContent = t("lieNeeded"); err.hidden = false; break; }
-      if(!LS.set("profile", F)) LS.set("profile", Object.assign({}, F, {photo: ""})); toast(t("profileSaved")); render(); break; }
+      if(!LS.set("profile", F)) LS.set("profile", Object.assign({}, F, {photo: ""})); toast(t("profileSaved"));
+      const next = A.afterProfile, code = A.pendingCode;
+      A.afterProfile = ""; A.pendingCode = ""; A.form = null;
+      if(next === "create") openCreate();
+      else if(next === "join" && code) await openByCode(code);
+      else render();
+      break; }
     case "checkIn": await busy(async () => { await api("checkIn", {room_id: A.roomId, person_id: myId(), episode: +v}); await poll(); }); break;
     case "newPost": A.view = "newpost"; A.postDraft = {}; A.postAud = "groups"; A.postTag = "trip"; A.postMax = 6; ["np-title","np-when","np-place"].forEach(k => delete A.kept[k]); render(); try{ window.scrollTo(0, 0); }catch(e){} break;
     case "planBoba": A.view = "newpost"; A.postDraft = {title: t("bobaTitle")}; A.postAud = "groups"; A.postTag = "food"; A.postMax = 6; ["np-title","np-when","np-place"].forEach(k => delete A.kept[k]);
@@ -2431,6 +2479,7 @@ document.addEventListener("click", async ev => {
     case "leavePost": await busy(async () => { const mj = LS.get("myJoins", {}); await api("leavePost", {post_id: v, join_id: mj[v]}); delete mj[v]; LS.set("myJoins", mj); await loadPosts(); }); break;
     case "startPost": await busy(async () => { const res = await api("startPost", {post_id: v, token: LS.get("myPosts", {})[v], lang: A.lang});
       const hs = hosts(); const post = (A.posts.posts || []).find(x => x.id === v) || {}; hs.unshift({room_id: res.room_id, token: res.token, code: res.code, name: post.title || "", created_at: new Date().toISOString()}); LS.set("hosts", hs.slice(0, 50));
+      try{ await joinSelf(res.room_id); }catch(e){ toast(errText(e)); }
       enterRoom(await api("getState", {room_id: res.room_id})); }); break;
     case "baseline": await busy(async () => { await api("baseline", {room_id: A.roomId, person_id: myId(), value: v}); setFlag("baseline"); toast(t("baseThanks")); render(); }); break;
     case "report": A.view = "report"; render(); try{ window.scrollTo(0, 0); }catch(e){} break;
@@ -2477,8 +2526,7 @@ document.addEventListener("click", async ev => {
         if(filled === 3 && !(F.lie >= 0)) return fail(t("lieNeeded"));
         if(!LS.set("profile", F)) LS.set("profile", Object.assign({}, F, {photo: ""}));
       }
-      const res = await api("join", {room_id: A.roomId, share_group: F.share_group !== false, name: F.name, avatar: F.avatar || "", major: F.major || "", year: F.year || "", contact_app: F.contact_app, contact_handle: F.contact_handle, from: F.from,
-        tt: F.tt.filter(Boolean).length === 3 ? F.tt : [], lie: F.tt.filter(Boolean).length === 3 ? F.lie : -1, tot: F.tot, ask_me: askMe(F), wish: F.wish, photo: guessPhoto(F)});
+      const res = await api("join", Object.assign({room_id: A.roomId}, profileBody(F)));
       const me = LS.get("me", {}); me[A.roomId] = res.person_id; LS.set("me", me);
       const jl = LS.get("joined", []).filter(x => x.room_id !== A.roomId); jl.unshift({room_id: A.roomId, code: A.st.room.code, name: A.st.room.name, at: new Date().toISOString()}); LS.set("joined", jl.slice(0, 20));
       A.role = "player"; A.form = null; A.editProfile = false; A.sig = ""; await poll(); }); break;
